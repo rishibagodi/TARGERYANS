@@ -2,6 +2,16 @@ import { useEffect, useMemo, useState } from 'react'
 
 const formatCurrency = (value) => `₹${value.toLocaleString()}`
 const digitsOnly = (value) => value.replace(/\D/g, '')
+const calculateMonthlyRepayment = (totalAmount, tenureMonths) => {
+  const amount = Number(totalAmount) || 0
+  const tenure = Number(tenureMonths) || 0
+
+  if (amount <= 0 || tenure <= 0) {
+    return 0
+  }
+
+  return amount / tenure
+}
 const SAVINGS_LEDGER_KEY = 'emi-savings-ledger-v1'
 const SAVINGS_MONTHS = [
   'January',
@@ -44,15 +54,21 @@ function App() {
   const [savedMoneyByMonth, setSavedMoneyByMonth] = useState(
     SAVINGS_MONTHS.reduce((acc, month) => ({ ...acc, [month]: '' }), {}),
   )
+  const [prepaymentLoanId, setPrepaymentLoanId] = useState(1)
+  const [prepaymentExtraPayment, setPrepaymentExtraPayment] = useState('')
   const [emiRows, setEmiRows] = useState([
-    { id: 1, loanName: 'Bike Loan', amount: '' },
-    { id: 2, loanName: 'Phone Loan', amount: '' },
+    { id: 1, loanName: 'Bike Loan', totalAmount: '', tenureMonths: '12' },
+    { id: 2, loanName: 'Phone Loan', totalAmount: '', tenureMonths: '12' },
   ])
 
   const totals = useMemo(() => {
     const income = Number(monthlyIncome) || 0
     const expenses = Number(monthlyExpenses) || 0
-    const totalEmi = emiRows.reduce((sum, row) => sum + (Number(row.amount) || 0), 0)
+    const totalLoanAmount = emiRows.reduce((sum, row) => sum + (Number(row.totalAmount) || 0), 0)
+    const totalEmi = emiRows.reduce(
+      (sum, row) => sum + calculateMonthlyRepayment(row.totalAmount, row.tenureMonths),
+      0,
+    )
     const ratio = income > 0 ? (totalEmi / income) * 100 : 0
     const monthlyBalance = income - totalEmi - expenses
 
@@ -64,6 +80,7 @@ function App() {
     return {
       income,
       expenses,
+      totalLoanAmount,
       totalEmi,
       ratio,
       monthlyBalance,
@@ -81,6 +98,7 @@ function App() {
 
     const income = analysisResult.summary.monthlyIncome
     const totalEmi = analysisResult.summary.totalEmi
+    const totalLoanAmount = analysisResult.summary.totalLoanAmount || 0
     const expenses = Number(monthlyExpenses) || 0
     const monthlyBalance = income - totalEmi - expenses
     const currentSurplus = Math.max(monthlyBalance, 0)
@@ -92,10 +110,13 @@ function App() {
         : null
     const recommendedSavingRate = income > 0 ? (recommendedMonthlySaving / income) * 100 : 0
     const surplusRatio = income > 0 ? (currentSurplus / income) * 100 : 0
-    const savingGoal = Number(monthlySavingGoal) || 0
+    const activeSavedAmount = [...savingsLedger].sort((a, b) => b.periodKey.localeCompare(a.periodKey))[0]?.savedAmount || 0
+    const savingGoal = Number(monthlySavingGoal) || activeSavedAmount || 0
     const goalFeasible = currentSurplus >= savingGoal
     const postGoalBalance = currentSurplus - savingGoal
     const goalCoverageRatio = savingGoal > 0 ? (currentSurplus / savingGoal) * 100 : 0
+    const debtClearanceMonths = currentSurplus > 0 ? Math.ceil(totalLoanAmount / currentSurplus) : null
+    const balanceAfterSaving = monthlyBalance - activeSavedAmount
 
     const futureSurplus = analysisResult.futureSnapshot
       ? Math.max(income - analysisResult.futureSnapshot.futureTotal - expenses, 0)
@@ -113,9 +134,53 @@ function App() {
       goalFeasible,
       postGoalBalance,
       goalCoverageRatio,
+      totalLoanAmount,
+      debtClearanceMonths,
+      activeSavedAmount,
+      balanceAfterSaving,
       futureSurplus,
     }
-  }, [analysisResult, monthlyExpenses, monthlySavingGoal])
+  }, [analysisResult, monthlyExpenses, monthlySavingGoal, savingsLedger])
+
+  const prepaymentPlanner = useMemo(() => {
+    if (!analysisResult) {
+      return null
+    }
+
+    const selectedLoan = emiRows.find((row) => String(row.id) === String(prepaymentLoanId)) || emiRows[0]
+
+    if (!selectedLoan) {
+      return null
+    }
+
+    const totalAmount = Number(selectedLoan.totalAmount) || 0
+    const tenureMonths = Number(selectedLoan.tenureMonths) || 0
+    const baseMonthlyRepayment = calculateMonthlyRepayment(totalAmount, tenureMonths)
+    const extraPayment = Number(prepaymentExtraPayment) || 0
+    const availableSurplus = savingsSnapshot?.currentSurplus || 0
+    const usableExtraPayment = Math.max(Math.min(extraPayment, availableSurplus), 0)
+    const acceleratedMonthlyPayment = baseMonthlyRepayment + usableExtraPayment
+    const payoffMonths =
+      totalAmount > 0 && acceleratedMonthlyPayment > 0 ? Math.ceil(totalAmount / acceleratedMonthlyPayment) : null
+    const standardPayoffMonths = totalAmount > 0 && baseMonthlyRepayment > 0 ? tenureMonths || null : null
+    const monthsSaved =
+      standardPayoffMonths && payoffMonths ? Math.max(standardPayoffMonths - payoffMonths, 0) : null
+
+    return {
+      selectedLoan,
+      totalAmount,
+      tenureMonths,
+      baseMonthlyRepayment,
+      extraPayment,
+      usableExtraPayment,
+      availableSurplus,
+      acceleratedMonthlyPayment,
+      payoffMonths,
+      standardPayoffMonths,
+      monthsSaved,
+      extraPaymentTooHigh: extraPayment > availableSurplus,
+    }
+  }, [analysisResult, emiRows, prepaymentExtraPayment, prepaymentLoanId, savingsSnapshot?.currentSurplus])
 
   const historicalSavings = useMemo(() => {
     const entries = Object.entries(savedMoneyByMonth)
@@ -166,7 +231,7 @@ function App() {
   const addEmiRow = () => {
     setEmiRows((rows) => [
       ...rows,
-      { id: Date.now(), loanName: `Loan ${rows.length + 1}`, amount: '' },
+      { id: Date.now(), loanName: `Loan ${rows.length + 1}`, totalAmount: '', tenureMonths: '12' },
     ])
   }
 
@@ -195,10 +260,12 @@ function App() {
     setApiError('')
     setAdvice(null)
     setEmiRows([
-      { id: 1, loanName: 'Bike Loan', amount: '' },
-      { id: 2, loanName: 'Phone Loan', amount: '' },
+      { id: 1, loanName: 'Bike Loan', totalAmount: '', tenureMonths: '12' },
+      { id: 2, loanName: 'Phone Loan', totalAmount: '', tenureMonths: '12' },
     ])
     setSavedMoneyByMonth(SAVINGS_MONTHS.reduce((acc, month) => ({ ...acc, [month]: '' }), {}))
+    setPrepaymentLoanId(1)
+    setPrepaymentExtraPayment('')
     setSavingsLedger([])
     if (typeof window !== 'undefined') {
       window.localStorage.removeItem(SAVINGS_LEDGER_KEY)
@@ -218,9 +285,14 @@ function App() {
         body: JSON.stringify({
           monthlyIncome: Number(monthlyIncome) || 0,
           futureEmi: Number(futureEmi) || 0,
+          loans: emiRows.map((row) => ({
+            loanName: row.loanName,
+            totalAmount: Number(row.totalAmount) || 0,
+            tenureMonths: Number(row.tenureMonths) || 0,
+          })),
           emis: emiRows.map((row) => ({
             loanName: row.loanName,
-            amount: Number(row.amount) || 0,
+            amount: calculateMonthlyRepayment(row.totalAmount, row.tenureMonths),
           })),
         }),
       })
@@ -247,11 +319,12 @@ function App() {
 
       setSavingsLedger((prev) => {
         const existingIndex = prev.findIndex((item) => item.periodKey === periodKey)
+        const postSavingBalance = computedMonthlyBalance - computedSavedAmount
         const newEntry = {
           periodKey,
           monthYearLabel,
           savedAmount: computedSavedAmount,
-          monthlyBalance: computedMonthlyBalance,
+          monthlyBalance: postSavingBalance,
           income: data.summary.monthlyIncome,
           expenses: Number(monthlyExpenses) || 0,
           emi: data.summary.totalEmi,
@@ -287,7 +360,14 @@ function App() {
             totalEmi: data.summary.totalEmi,
             ratio: data.summary.ratio,
             riskLabel: data.currentRisk.label,
-            emiBreakdown: emiRows.filter((r) => Number(r.amount) > 0),
+            emiBreakdown: emiRows
+              .map((row) => ({
+                loanName: row.loanName,
+                totalAmount: Number(row.totalAmount) || 0,
+                tenureMonths: Number(row.tenureMonths) || 0,
+                monthlyEmi: calculateMonthlyRepayment(row.totalAmount, row.tenureMonths),
+              }))
+              .filter((row) => row.totalAmount > 0 && row.tenureMonths > 0),
           }),
         })
 
@@ -334,7 +414,7 @@ function App() {
       <div className="relative mx-auto max-w-6xl space-y-8">
         <header className="rise-in text-center">
           <p className="inline-flex rounded-full border border-slate-200 bg-white px-4 py-1.5 text-[11px] font-bold uppercase tracking-[0.2em] text-slate-700 shadow-sm">
-            Personal Finance Studio
+            LoanLens
           </p>
           <h1 className="mt-4 text-4xl font-bold tracking-tight text-slate-900 md:text-6xl">
             EMI Planning That Feels Executive
@@ -363,7 +443,7 @@ function App() {
 
             <div className="grid w-full grid-cols-2 gap-3 md:w-auto md:min-w-[380px]">
               <div className="hero-stat">
-                <p className="hero-stat-label">Current EMI</p>
+                <p className="hero-stat-label">Monthly Commitment</p>
                 <p className="hero-stat-value">{formatCurrency(totals.totalEmi)}</p>
               </div>
               <div className="hero-stat">
@@ -377,7 +457,7 @@ function App() {
         <section className="rise-in-delay glass-card p-5 md:p-8">
           <p className="section-kicker">Data Capture</p>
           <h2 className="section-title">Input Section</h2>
-          <p className="section-note">Capture income, monthly expenses, and current EMIs to generate a precise affordability view.</p>
+          <p className="section-note">Capture income, monthly expenses, and each loan's total amount plus tenure to generate a precise affordability view.</p>
 
           <div className="mt-5 grid gap-5 md:grid-cols-2">
             <label className="space-y-2">
@@ -491,20 +571,20 @@ function App() {
 
           <div className="mt-6 space-y-3">
             <div className="flex items-center justify-between">
-              <h3 className="text-lg font-semibold text-slate-800">Current EMIs</h3>
+              <h3 className="text-lg font-semibold text-slate-800">Loan Schedule</h3>
               <button
                 type="button"
                 onClick={addEmiRow}
                 className="pill-btn"
               >
-                + Add EMI
+                + Add Loan
               </button>
             </div>
 
             {emiRows.map((row) => (
               <div
                 key={row.id}
-                className="rise-in grid gap-3 rounded-xl border border-slate-200/80 bg-white/80 p-3 shadow-sm backdrop-blur-sm md:grid-cols-[2fr_1.5fr_auto]"
+                className="rise-in grid gap-3 rounded-xl border border-slate-200/80 bg-white/80 p-3 shadow-sm backdrop-blur-sm md:grid-cols-[2fr_1.35fr_1.2fr_auto]"
               >
                 <label className="space-y-1">
                   <span className="text-xs font-medium uppercase tracking-wide text-slate-500">
@@ -521,16 +601,33 @@ function App() {
 
                 <label className="space-y-1">
                   <span className="text-xs font-medium uppercase tracking-wide text-slate-500">
-                    Monthly EMI
+                    Total Loan Amount
                   </span>
                   <input
                     type="text"
                     inputMode="numeric"
-                    value={row.amount}
-                    onChange={(e) => updateRow(row.id, 'amount', digitsOnly(e.target.value))}
-                    placeholder="Amount"
+                    value={row.totalAmount}
+                    onChange={(e) => updateRow(row.id, 'totalAmount', digitsOnly(e.target.value))}
+                    placeholder="Total amount borrowed"
                     className="input-field"
                   />
+                </label>
+
+                <label className="space-y-1">
+                  <span className="text-xs font-medium uppercase tracking-wide text-slate-500">
+                    EMI Period (Months)
+                  </span>
+                  <input
+                    type="text"
+                    inputMode="numeric"
+                    value={row.tenureMonths}
+                    onChange={(e) => updateRow(row.id, 'tenureMonths', digitsOnly(e.target.value))}
+                    placeholder="12"
+                    className="input-field"
+                  />
+                  <p className="text-xs text-slate-500">
+                    Estimated monthly EMI: <span className="font-semibold text-slate-700">{formatCurrency(calculateMonthlyRepayment(row.totalAmount, row.tenureMonths))}</span>
+                  </p>
                 </label>
 
                 <button
@@ -601,6 +698,11 @@ function App() {
                         month: 'long',
                         year: 'numeric',
                       })
+                      const currentMonthlyBalance =
+                        analysisResult.summary.monthlyIncome -
+                        analysisResult.summary.totalEmi -
+                        (Number(monthlyExpenses) || 0)
+                      const postSavingBalance = currentMonthlyBalance - savingAmount
                       
                       setSavingsLedger((prev) => {
                         const existingIndex = prev.findIndex((item) => item.periodKey === periodKey)
@@ -608,7 +710,7 @@ function App() {
                           periodKey,
                           monthYearLabel,
                           savedAmount: savingAmount,
-                          monthlyBalance: analysisResult.summary.monthlyIncome - analysisResult.summary.totalEmi - (Number(monthlyExpenses) || 0),
+                          monthlyBalance: postSavingBalance,
                           income: analysisResult.summary.monthlyIncome,
                           expenses: Number(monthlyExpenses) || 0,
                           emi: analysisResult.summary.totalEmi,
@@ -664,13 +766,20 @@ function App() {
                 <p className="mt-1 text-2xl font-semibold text-slate-900">{analysisResult.summary.ratio.toFixed(1)}%</p>
               </div>
               <div className="metric-card">
-                <p className="text-sm text-slate-500">Monthly Balance</p>
+                <p className="text-sm text-slate-500">Monthly Balance After Saving</p>
+                {savingsSnapshot?.activeSavedAmount > 0 && (
+                  <p className="mt-1 text-xs text-slate-500">
+                    Saved amount: {formatCurrency(savingsSnapshot.activeSavedAmount)}
+                  </p>
+                )}
                 <p
                   className={`mt-1 text-2xl font-semibold ${
-                    totals.monthlyBalance >= 0 ? 'text-emerald-700' : 'text-rose-700'
+                    (savingsSnapshot?.balanceAfterSaving ?? totals.monthlyBalance) >= 0
+                      ? 'text-emerald-700'
+                      : 'text-rose-700'
                   }`}
                 >
-                  {formatCurrency(totals.monthlyBalance)}
+                  {formatCurrency(savingsSnapshot?.balanceAfterSaving ?? totals.monthlyBalance)}
                 </p>
               </div>
             </div>
@@ -727,13 +836,13 @@ function App() {
 
                 <div className="mt-4 grid gap-4 md:grid-cols-3">
                   <div className="rounded-xl border border-emerald-100 bg-white/90 p-4">
-                    <p className="text-xs uppercase tracking-wide text-slate-500">Monthly Balance</p>
+                    <p className="text-xs uppercase tracking-wide text-slate-500">Monthly Balance After Saving</p>
                     <p
                       className={`mt-1 text-xl font-semibold ${
-                        savingsSnapshot.monthlyBalance >= 0 ? 'text-slate-900' : 'text-rose-700'
+                        savingsSnapshot.balanceAfterSaving >= 0 ? 'text-slate-900' : 'text-rose-700'
                       }`}
                     >
-                      {formatCurrency(savingsSnapshot.monthlyBalance)}
+                      {formatCurrency(savingsSnapshot.balanceAfterSaving)}
                     </p>
                   </div>
                   <div className="rounded-xl border border-emerald-100 bg-white/90 p-4">
@@ -776,6 +885,11 @@ function App() {
                       <p className="mt-1 text-lg font-semibold text-slate-900">
                         {formatCurrency(savingsSnapshot.savingGoal)}
                       </p>
+                      {savingsSnapshot.activeSavedAmount > 0 && (
+                        <p className="mt-1 text-xs text-slate-500">
+                          Using saved amount: {formatCurrency(savingsSnapshot.activeSavedAmount)}
+                        </p>
+                      )}
                     </div>
                     <div>
                       <p className="text-xs uppercase tracking-wide text-slate-500">Left After Saving</p>
@@ -830,6 +944,107 @@ function App() {
                   </div>
                 </div>
 
+                <div className="mt-4 rounded-xl border border-sky-100 bg-white/90 p-4">
+                  <div className="flex flex-wrap items-center justify-between gap-3">
+                    <div>
+                      <p className="text-sm font-medium text-slate-700">Prepayment Planner</p>
+                      <p className="mt-1 text-sm text-slate-600">
+                        See how extra monthly payment can shorten the selected loan.
+                      </p>
+                    </div>
+                    <span className="rounded-full bg-sky-100 px-3 py-1 text-xs font-semibold text-sky-700">
+                      Uses monthly surplus first
+                    </span>
+                  </div>
+
+                  <div className="mt-4 grid gap-3 md:grid-cols-[1.5fr_1fr_1fr]">
+                    <label className="space-y-2">
+                      <span className="text-xs font-medium uppercase tracking-wide text-slate-500">Select Loan</span>
+                      <select
+                        value={prepaymentLoanId}
+                        onChange={(e) => setPrepaymentLoanId(e.target.value)}
+                        className="input-field"
+                      >
+                        {emiRows.map((row) => (
+                          <option key={row.id} value={row.id}>
+                            {row.loanName || `Loan ${row.id}`}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+
+                    <label className="space-y-2">
+                      <span className="text-xs font-medium uppercase tracking-wide text-slate-500">Extra Monthly Payment</span>
+                      <input
+                        type="text"
+                        inputMode="numeric"
+                        value={prepaymentExtraPayment}
+                        onChange={(e) => setPrepaymentExtraPayment(digitsOnly(e.target.value))}
+                        placeholder="Optional extra payment"
+                        className="input-field"
+                      />
+                    </label>
+
+                    <div className="rounded-xl border border-sky-100 bg-sky-50/70 p-4">
+                      <p className="text-xs uppercase tracking-wide text-slate-500">Available Surplus</p>
+                      <p className="mt-1 text-lg font-semibold text-slate-900">
+                        {formatCurrency(savingsSnapshot.currentSurplus)}
+                      </p>
+                    </div>
+                  </div>
+
+                  {prepaymentPlanner && (
+                    <div className="mt-4 grid gap-3 md:grid-cols-4">
+                      <div className="rounded-lg border border-slate-200 bg-slate-50 p-3">
+                        <p className="text-xs uppercase tracking-wide text-slate-500">Loan EMI</p>
+                        <p className="mt-1 text-lg font-semibold text-slate-900">
+                          {formatCurrency(prepaymentPlanner.baseMonthlyRepayment)}
+                        </p>
+                      </div>
+                      <div className="rounded-lg border border-slate-200 bg-slate-50 p-3">
+                        <p className="text-xs uppercase tracking-wide text-slate-500">With Extra Payment</p>
+                        <p className="mt-1 text-lg font-semibold text-slate-900">
+                          {formatCurrency(prepaymentPlanner.acceleratedMonthlyPayment)}
+                        </p>
+                      </div>
+                      <div className="rounded-lg border border-slate-200 bg-slate-50 p-3">
+                        <p className="text-xs uppercase tracking-wide text-slate-500">New Payoff Time</p>
+                        <p className="mt-1 text-lg font-semibold text-slate-900">
+                          {prepaymentPlanner.payoffMonths ?? 'N/A'} months
+                        </p>
+                      </div>
+                      <div className="rounded-lg border border-slate-200 bg-slate-50 p-3">
+                        <p className="text-xs uppercase tracking-wide text-slate-500">Months Saved</p>
+                        <p className="mt-1 text-lg font-semibold text-slate-900">
+                          {prepaymentPlanner.monthsSaved ?? 'N/A'}
+                        </p>
+                      </div>
+                    </div>
+                  )}
+
+                  {prepaymentPlanner && (
+                    <div className="mt-4 rounded-lg border border-sky-100 bg-sky-50/70 p-4 text-sm text-slate-700">
+                      <p>
+                        The selected loan is{' '}
+                        <span className="font-semibold text-slate-900">{prepaymentPlanner.selectedLoan.loanName}</span>.
+                      </p>
+                      <p className="mt-1">
+                        If you add{' '}
+                        <span className="font-semibold text-slate-900">
+                          {formatCurrency(prepaymentPlanner.usableExtraPayment)}
+                        </span>{' '}
+                        extra every month, it can be cleared in about{' '}
+                        <span className="font-semibold text-slate-900">{prepaymentPlanner.payoffMonths ?? 'N/A'} months</span>.
+                      </p>
+                      {prepaymentPlanner.extraPaymentTooHigh && (
+                        <p className="mt-1 text-rose-700">
+                          Your extra payment is higher than the current surplus, so the planner is using the available surplus amount instead.
+                        </p>
+                      )}
+                    </div>
+                  )}
+                </div>
+
                 <div className="mt-4 rounded-xl border border-emerald-100 bg-white/90 p-4 text-sm text-slate-700">
                   <p>
                     You can reach your emergency fund target in approximately{' '}
@@ -869,6 +1084,20 @@ function App() {
                     </span>
                     .
                   </p>
+                  <div className="mt-3 rounded-lg border border-slate-200 bg-slate-50 p-3">
+                    <p className="text-xs uppercase tracking-wide text-slate-500">Debt Clearance Plan</p>
+                    <p className="mt-1">
+                      With a total loan amount of{' '}
+                      <span className="font-semibold text-slate-900">
+                        {formatCurrency(savingsSnapshot.totalLoanAmount)}
+                      </span>{' '}
+                      and your current monthly surplus, you can clear the full amount in about{' '}
+                      <span className="font-semibold text-slate-900">
+                        {savingsSnapshot.debtClearanceMonths ?? 'N/A'} months
+                      </span>{' '}
+                      if you direct the surplus to prepayment.
+                    </p>
+                  </div>
                 </div>
               </div>
             )}

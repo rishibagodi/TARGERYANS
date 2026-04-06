@@ -1,11 +1,49 @@
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 
 const formatCurrency = (value) => `₹${value.toLocaleString()}`
+const digitsOnly = (value) => value.replace(/\D/g, '')
+const SAVINGS_LEDGER_KEY = 'emi-savings-ledger-v1'
+const SAVINGS_MONTHS = [
+  'January',
+  'February',
+  'March',
+  'April',
+  'May',
+  'June',
+  'July',
+  'August',
+  'September',
+  'October',
+  'November',
+  'December',
+]
 
 function App() {
   const [monthlyIncome, setMonthlyIncome] = useState('')
+  const [monthlyExpenses, setMonthlyExpenses] = useState('')
+  const [monthlySavingGoal, setMonthlySavingGoal] = useState('')
   const [futureEmi, setFutureEmi] = useState('')
   const [hasAnalyzed, setHasAnalyzed] = useState(false)
+  const [analysisResult, setAnalysisResult] = useState(null)
+  const [isLoading, setIsLoading] = useState(false)
+  const [apiError, setApiError] = useState('')
+  const [advice, setAdvice] = useState(null)
+  const [isLoadingAdvice, setIsLoadingAdvice] = useState(false)
+  const [savingsLedger, setSavingsLedger] = useState(() => {
+    if (typeof window === 'undefined') {
+      return []
+    }
+
+    try {
+      const stored = window.localStorage.getItem(SAVINGS_LEDGER_KEY)
+      return stored ? JSON.parse(stored) : []
+    } catch {
+      return []
+    }
+  })
+  const [savedMoneyByMonth, setSavedMoneyByMonth] = useState(
+    SAVINGS_MONTHS.reduce((acc, month) => ({ ...acc, [month]: '' }), {}),
+  )
   const [emiRows, setEmiRows] = useState([
     { id: 1, loanName: 'Bike Loan', amount: '' },
     { id: 2, loanName: 'Phone Loan', amount: '' },
@@ -13,52 +51,117 @@ function App() {
 
   const totals = useMemo(() => {
     const income = Number(monthlyIncome) || 0
+    const expenses = Number(monthlyExpenses) || 0
     const totalEmi = emiRows.reduce((sum, row) => sum + (Number(row.amount) || 0), 0)
     const ratio = income > 0 ? (totalEmi / income) * 100 : 0
+    const monthlyBalance = income - totalEmi - expenses
 
     const future = Number(futureEmi) || 0
     const futureTotal = totalEmi + future
     const futureRatio = income > 0 ? (futureTotal / income) * 100 : 0
+    const futureBalance = income - futureTotal - expenses
 
     return {
       income,
+      expenses,
       totalEmi,
       ratio,
+      monthlyBalance,
       future,
       futureTotal,
       futureRatio,
+      futureBalance,
     }
-  }, [emiRows, monthlyIncome, futureEmi])
+  }, [emiRows, monthlyIncome, monthlyExpenses, futureEmi])
 
-  const getRiskMeta = (ratio) => {
-    if (ratio <= 30) {
-      return {
-        label: 'Safe',
-        color: '#16a34a',
-        badge: 'bg-green-100 text-green-700 border-green-200',
-        advice: 'Your EMI load is healthy. Keep an emergency buffer and avoid stretching beyond needs.',
-      }
+  const savingsSnapshot = useMemo(() => {
+    if (!analysisResult) {
+      return null
     }
 
-    if (ratio <= 45) {
-      return {
-        label: 'Moderate',
-        color: '#d97706',
-        badge: 'bg-amber-100 text-amber-700 border-amber-200',
-        advice: 'Your EMI obligations are manageable but tight. Reduce new borrowing and boost savings.',
-      }
-    }
+    const income = analysisResult.summary.monthlyIncome
+    const totalEmi = analysisResult.summary.totalEmi
+    const expenses = Number(monthlyExpenses) || 0
+    const monthlyBalance = income - totalEmi - expenses
+    const currentSurplus = Math.max(monthlyBalance, 0)
+    const recommendedMonthlySaving = Math.max(Math.min(income * 0.2, currentSurplus), 0)
+    const emergencyFundTarget = Math.max(expenses * 6, income * 0.5)
+    const monthsToEmergencyFund =
+      recommendedMonthlySaving > 0
+        ? Math.ceil(emergencyFundTarget / recommendedMonthlySaving)
+        : null
+    const recommendedSavingRate = income > 0 ? (recommendedMonthlySaving / income) * 100 : 0
+    const surplusRatio = income > 0 ? (currentSurplus / income) * 100 : 0
+    const savingGoal = Number(monthlySavingGoal) || 0
+    const goalFeasible = currentSurplus >= savingGoal
+    const postGoalBalance = currentSurplus - savingGoal
+    const goalCoverageRatio = savingGoal > 0 ? (currentSurplus / savingGoal) * 100 : 0
+
+    const futureSurplus = analysisResult.futureSnapshot
+      ? Math.max(income - analysisResult.futureSnapshot.futureTotal - expenses, 0)
+      : null
 
     return {
-      label: 'High Risk',
-      color: '#dc2626',
-      badge: 'bg-red-100 text-red-700 border-red-200',
-      advice: 'Your EMI burden is high. Prioritize debt reduction and delay new loans where possible.',
+      monthlyBalance,
+      currentSurplus,
+      recommendedMonthlySaving,
+      emergencyFundTarget,
+      monthsToEmergencyFund,
+      recommendedSavingRate,
+      surplusRatio,
+      savingGoal,
+      goalFeasible,
+      postGoalBalance,
+      goalCoverageRatio,
+      futureSurplus,
     }
-  }
+  }, [analysisResult, monthlyExpenses, monthlySavingGoal])
 
-  const currentRisk = getRiskMeta(totals.ratio)
-  const futureRisk = getRiskMeta(totals.futureRatio)
+  const historicalSavings = useMemo(() => {
+    const entries = Object.entries(savedMoneyByMonth)
+    const totals = entries.reduce(
+      (acc, [month, amount]) => {
+        const numericAmount = Number(amount) || 0
+        return {
+          totalSaved: acc.totalSaved + numericAmount,
+          activeMonths: acc.activeMonths + (numericAmount > 0 ? 1 : 0),
+          highestMonth:
+            numericAmount > acc.highestMonth.amount
+              ? { month, amount: numericAmount }
+              : acc.highestMonth,
+        }
+      },
+      { totalSaved: 0, activeMonths: 0, highestMonth: { month: '-', amount: 0 } },
+    )
+
+    const averageSaved = totals.activeMonths > 0 ? totals.totalSaved / totals.activeMonths : 0
+
+    return {
+      ...totals,
+      averageSaved,
+    }
+  }, [savedMoneyByMonth])
+
+  const latestLedgerEntry = useMemo(() => {
+    if (savingsLedger.length === 0) {
+      return null
+    }
+    return [...savingsLedger].sort((a, b) => b.periodKey.localeCompare(a.periodKey))[0]
+  }, [savingsLedger])
+
+  useEffect(() => {
+    if (typeof window === 'undefined') {
+      return
+    }
+    window.localStorage.setItem(SAVINGS_LEDGER_KEY, JSON.stringify(savingsLedger))
+  }, [savingsLedger])
+
+  const updateSavedMoney = (month, value) => {
+    setSavedMoneyByMonth((prev) => ({
+      ...prev,
+      [month]: digitsOnly(value),
+    }))
+  }
 
   const addEmiRow = () => {
     setEmiRows((rows) => [
@@ -82,37 +185,173 @@ function App() {
     )
   }
 
-  const onAnalyze = () => {
-    setHasAnalyzed(true)
+  const clearAllData = () => {
+    setMonthlyIncome('')
+    setMonthlyExpenses('')
+    setMonthlySavingGoal('')
+    setFutureEmi('')
+    setHasAnalyzed(false)
+    setAnalysisResult(null)
+    setApiError('')
+    setAdvice(null)
+    setEmiRows([
+      { id: 1, loanName: 'Bike Loan', amount: '' },
+      { id: 2, loanName: 'Phone Loan', amount: '' },
+    ])
+    setSavedMoneyByMonth(SAVINGS_MONTHS.reduce((acc, month) => ({ ...acc, [month]: '' }), {}))
+    setSavingsLedger([])
+    if (typeof window !== 'undefined') {
+      window.localStorage.removeItem(SAVINGS_LEDGER_KEY)
+    }
+  }
+
+  const onAnalyze = async () => {
+    setApiError('')
+    setIsLoading(true)
+
+    try {
+      const response = await fetch('/api/analyze', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          monthlyIncome: Number(monthlyIncome) || 0,
+          futureEmi: Number(futureEmi) || 0,
+          emis: emiRows.map((row) => ({
+            loanName: row.loanName,
+            amount: Number(row.amount) || 0,
+          })),
+        }),
+      })
+
+      const data = await response.json()
+
+      if (!response.ok) {
+        throw new Error(data.message || 'Unable to analyze EMI details right now.')
+      }
+
+      setAnalysisResult(data)
+      setHasAnalyzed(true)
+      setAdvice(null)
+
+      const now = new Date()
+      const periodKey = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`
+      const monthYearLabel = now.toLocaleDateString('en-IN', {
+        month: 'long',
+        year: 'numeric',
+      })
+      const computedMonthlyBalance =
+        data.summary.monthlyIncome - data.summary.totalEmi - (Number(monthlyExpenses) || 0)
+      const computedSavedAmount = Math.max(computedMonthlyBalance, 0)
+
+      setSavingsLedger((prev) => {
+        const existingIndex = prev.findIndex((item) => item.periodKey === periodKey)
+        const newEntry = {
+          periodKey,
+          monthYearLabel,
+          savedAmount: computedSavedAmount,
+          monthlyBalance: computedMonthlyBalance,
+          income: data.summary.monthlyIncome,
+          expenses: Number(monthlyExpenses) || 0,
+          emi: data.summary.totalEmi,
+          updatedAt: new Date().toISOString(),
+        }
+
+        if (existingIndex >= 0) {
+          const updated = [...prev]
+          updated[existingIndex] = newEntry
+          return updated
+        }
+
+        return [...prev, newEntry]
+      })
+
+      const currentMonth = now.toLocaleDateString('en-IN', { month: 'long' })
+      setSavedMoneyByMonth((prev) => ({
+        ...prev,
+        [currentMonth]: String(computedSavedAmount),
+      }))
+
+      // Fetch personalized advice from Claude
+      setIsLoadingAdvice(true)
+      try {
+        const adviceResponse = await fetch('/api/advice', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            monthlyIncome: Number(monthlyIncome) || 0,
+            monthlyExpenses: Number(monthlyExpenses) || 0,
+            totalEmi: data.summary.totalEmi,
+            ratio: data.summary.ratio,
+            riskLabel: data.currentRisk.label,
+            emiBreakdown: emiRows.filter((r) => Number(r.amount) > 0),
+          }),
+        })
+
+        const rawAdvice = await adviceResponse.text()
+        let adviceData = {}
+
+        if (rawAdvice) {
+          try {
+            adviceData = JSON.parse(rawAdvice)
+          } catch {
+            adviceData = {}
+          }
+        }
+
+        if (!adviceResponse.ok) {
+          setAdvice(
+            adviceData.message ||
+              adviceData.advice ||
+              'Claude advice is unavailable. Set CLAUDE_API_KEY in emi-backend/.env and restart backend.',
+          )
+        } else {
+          setAdvice(adviceData.advice || 'Unable to generate advice at this time.')
+        }
+      } catch (error) {
+        console.error('Advice fetch error:', error)
+        setAdvice('Unable to generate personalized advice right now.')
+      } finally {
+        setIsLoadingAdvice(false)
+      }
+    } catch (error) {
+      setApiError(error.message)
+      setHasAnalyzed(false)
+    } finally {
+      setIsLoading(false)
+    }
   }
 
   return (
-    <main className="relative min-h-screen overflow-hidden bg-[linear-gradient(145deg,#f5f7ff_0%,#eff6ff_35%,#f8fafc_100%)] px-4 py-10 md:px-8">
-      <div className="pointer-events-none absolute -left-20 top-20 h-72 w-72 rounded-full bg-cyan-200/40 blur-3xl" />
-      <div className="pointer-events-none absolute -right-20 top-12 h-72 w-72 rounded-full bg-amber-200/40 blur-3xl" />
-      <div className="pointer-events-none absolute bottom-8 left-1/2 h-52 w-52 -translate-x-1/2 rounded-full bg-sky-100/60 blur-3xl" />
+    <main className="relative min-h-screen overflow-hidden px-4 py-10 md:px-8 md:py-12">
+      <div className="pointer-events-none absolute -left-28 top-12 h-80 w-80 rounded-full bg-sky-300/35 blur-3xl" />
+      <div className="pointer-events-none absolute -right-24 top-20 h-80 w-80 rounded-full bg-emerald-300/30 blur-3xl" />
+      <div className="pointer-events-none absolute bottom-0 left-1/2 h-56 w-56 -translate-x-1/2 rounded-full bg-blue-200/35 blur-3xl" />
 
-      <div className="relative mx-auto max-w-5xl space-y-8">
+      <div className="relative mx-auto max-w-6xl space-y-8">
         <header className="rise-in text-center">
-          <p className="text-xs font-semibold uppercase tracking-[0.24em] text-slate-500 md:text-sm">
-            EMI Risk Analyzer
+          <p className="inline-flex rounded-full border border-slate-200 bg-white px-4 py-1.5 text-[11px] font-bold uppercase tracking-[0.2em] text-slate-700 shadow-sm">
+            Personal Finance Studio
           </p>
-          <h1 className="mt-3 text-3xl font-bold tracking-tight text-slate-900 md:text-5xl">
-            Plan Borrowing With Clarity
+          <h1 className="mt-4 text-4xl font-bold tracking-tight text-slate-900 md:text-6xl">
+            EMI Planning That Feels Executive
           </h1>
-          <p className="mx-auto mt-3 max-w-2xl text-sm text-slate-600 md:text-base">
-            A clean monthly snapshot of your current EMI pressure and future loan impact.
+          <p className="mx-auto mt-4 max-w-3xl text-sm text-slate-600 md:text-base">
+            Evaluate your monthly debt load, project future loans, and track realistic savings goals with a dashboard built for clear decision making.
           </p>
 
-          <div className="mx-auto mt-6 grid max-w-3xl grid-cols-2 gap-3 md:grid-cols-4">
-            <div className="hero-chip">No page reloads</div>
-            <div className="hero-chip">Dynamic EMI rows</div>
-            <div className="hero-chip">Risk aware insights</div>
-            <div className="hero-chip">Future snapshot</div>
+          <div className="mx-auto mt-6 grid max-w-4xl grid-cols-2 gap-3 md:grid-cols-4">
+            <div className="hero-chip">Fast risk classification</div>
+            <div className="hero-chip">Smart savings snapshots</div>
+            <div className="hero-chip">Month-year ledger tracking</div>
+            <div className="hero-chip">AI financial guidance</div>
           </div>
         </header>
 
-        <section className="rise-in rounded-3xl border border-white/60 bg-[linear-gradient(115deg,#0f172a_0%,#1e293b_42%,#0c4a6e_100%)] p-6 text-white shadow-[0_20px_40px_rgba(15,23,42,0.25)] md:p-8">
+        <section className="rise-in panel-deep">
           <div className="flex flex-col gap-6 md:flex-row md:items-end md:justify-between">
             <div>
               <p className="text-xs uppercase tracking-[0.22em] text-sky-200">Live Overview</p>
@@ -136,16 +375,18 @@ function App() {
         </section>
 
         <section className="rise-in-delay glass-card p-5 md:p-8">
-          <h2 className="text-xl font-semibold text-slate-900">Input Section</h2>
+          <p className="section-kicker">Data Capture</p>
+          <h2 className="section-title">Input Section</h2>
+          <p className="section-note">Capture income, monthly expenses, and current EMIs to generate a precise affordability view.</p>
 
           <div className="mt-5 grid gap-5 md:grid-cols-2">
             <label className="space-y-2">
               <span className="text-sm font-medium text-slate-600">Monthly Income</span>
               <input
-                type="number"
-                min="0"
+                type="text"
+                inputMode="numeric"
                 value={monthlyIncome}
-                onChange={(e) => setMonthlyIncome(e.target.value)}
+                onChange={(e) => setMonthlyIncome(digitsOnly(e.target.value))}
                 placeholder="Enter monthly income"
                 className="input-field"
               />
@@ -154,14 +395,98 @@ function App() {
             <label className="space-y-2">
               <span className="text-sm font-medium text-slate-600">Planning a new loan?</span>
               <input
-                type="number"
-                min="0"
+                type="text"
+                inputMode="numeric"
                 value={futureEmi}
-                onChange={(e) => setFutureEmi(e.target.value)}
+                onChange={(e) => setFutureEmi(digitsOnly(e.target.value))}
                 placeholder="Optional future EMI"
                 className="input-field"
               />
             </label>
+          </div>
+
+          <div className="sub-panel mt-5">
+            <h3 className="text-lg font-semibold text-slate-800">Own Expenses</h3>
+            <p className="mt-1 text-sm text-slate-600">
+              Add your regular monthly living expenses to calculate actual monthly balance.
+            </p>
+
+            <label className="mt-3 block space-y-2">
+              <span className="text-sm font-medium text-slate-600">Monthly Expenses</span>
+              <input
+                type="text"
+                inputMode="numeric"
+                value={monthlyExpenses}
+                onChange={(e) => setMonthlyExpenses(digitsOnly(e.target.value))}
+                placeholder="Rent, food, travel, utilities..."
+                className="input-field"
+              />
+            </label>
+
+          </div>
+
+          <div className="sub-panel mt-5">
+            <h3 className="text-lg font-semibold text-slate-800">Saved Money (Month-wise)</h3>
+            <p className="mt-1 text-sm text-slate-600">
+              On every Analyze click, the app auto-saves this month's amount with month and year.
+            </p>
+
+            <div className="mt-3 rounded-xl border border-sky-200 bg-sky-50/80 p-4">
+              <p className="text-xs uppercase tracking-wide text-sky-700">Latest Auto-Saved Record</p>
+              {latestLedgerEntry ? (
+                <p className="mt-1 text-sm text-slate-700">
+                  {latestLedgerEntry.monthYearLabel}: <span className="font-semibold text-slate-900">{formatCurrency(latestLedgerEntry.savedAmount)}</span>
+                </p>
+              ) : (
+                <p className="mt-1 text-sm text-slate-600">No monthly record yet. Click Analyze to auto-save current month.</p>
+              )}
+            </div>
+
+            <div className="mt-4 grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+              {SAVINGS_MONTHS.map((month) => (
+                <label key={month} className="space-y-2 rounded-xl border border-slate-200 bg-white p-3">
+                  <span className="text-sm font-medium text-slate-700">{month}</span>
+                  <input
+                    type="text"
+                    inputMode="numeric"
+                    value={savedMoneyByMonth[month]}
+                    onChange={(e) => updateSavedMoney(month, e.target.value)}
+                    placeholder="Saved amount"
+                    className="input-field"
+                  />
+                </label>
+              ))}
+            </div>
+
+            <div className="mt-4 rounded-xl border border-emerald-200 bg-emerald-50/70 p-4">
+              <p className="text-xs uppercase tracking-wide text-emerald-700">Total Saved So Far</p>
+              <p className="mt-1 text-2xl font-semibold text-emerald-800">
+                {formatCurrency(historicalSavings.totalSaved)}
+              </p>
+            </div>
+
+            <div className="mt-4 rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
+              <p className="text-xs uppercase tracking-wide text-slate-500">Month & Year Ledger</p>
+              <div className="mt-2 max-h-48 space-y-2 overflow-auto pr-1">
+                {savingsLedger.length === 0 ? (
+                  <p className="text-sm text-slate-500">No entries yet.</p>
+                ) : (
+                  [...savingsLedger]
+                    .sort((a, b) => b.periodKey.localeCompare(a.periodKey))
+                    .map((entry) => (
+                      <div key={entry.periodKey} className="rounded-lg border border-slate-200 bg-slate-50/90 p-3 text-sm shadow-sm">
+                        <div className="flex items-center justify-between gap-3">
+                          <span className="font-medium text-slate-700">{entry.monthYearLabel}</span>
+                          <span className="font-semibold text-emerald-700">{formatCurrency(entry.savedAmount)}</span>
+                        </div>
+                        <p className="mt-1 text-xs text-slate-500">
+                          Balance: {formatCurrency(entry.monthlyBalance)} | Income: {formatCurrency(entry.income)} | Expenses: {formatCurrency(entry.expenses)} | EMI: {formatCurrency(entry.emi)}
+                        </p>
+                      </div>
+                    ))
+                )}
+              </div>
+            </div>
           </div>
 
           <div className="mt-6 space-y-3">
@@ -199,10 +524,10 @@ function App() {
                     Monthly EMI
                   </span>
                   <input
-                    type="number"
-                    min="0"
+                    type="text"
+                    inputMode="numeric"
                     value={row.amount}
-                    onChange={(e) => updateRow(row.id, 'amount', e.target.value)}
+                    onChange={(e) => updateRow(row.id, 'amount', digitsOnly(e.target.value))}
                     placeholder="Amount"
                     className="input-field"
                   />
@@ -219,31 +544,134 @@ function App() {
             ))}
           </div>
 
-          <button
-            type="button"
-            onClick={onAnalyze}
-            className="pill-btn mt-6 w-full md:w-auto"
-          >
-            Analyze
-          </button>
+          <div className="mt-6 flex flex-col gap-3 sm:flex-row sm:gap-4">
+            <button
+              type="button"
+              onClick={onAnalyze}
+              disabled={isLoading}
+              className="pill-btn flex-1 sm:flex-none"
+            >
+              {isLoading ? 'Analyzing...' : 'Analyze'}
+            </button>
+            <button
+              type="button"
+              onClick={clearAllData}
+              className="danger-btn flex-1 sm:flex-none"
+            >
+              Clear All Data
+            </button>
+          </div>
+
+          {apiError && <p className="mt-4 text-sm font-medium text-rose-600">{apiError}</p>}
         </section>
 
-        {hasAnalyzed && (
+        {hasAnalyzed && analysisResult && (
           <section className="rise-in glass-card space-y-5 p-5 md:p-8">
-            <h2 className="text-xl font-semibold text-slate-900">Results Section</h2>
+            <p className="section-kicker">Insights</p>
+            <h2 className="section-title">Results Section</h2>
+            <p className="section-note">Review your ratio, risk profile, future debt impact, and savings plan in one place.</p>
 
-            <div className="grid gap-4 md:grid-cols-3">
+            <div className="rounded-2xl border border-amber-200 bg-gradient-to-r from-amber-50 to-orange-50 p-5 shadow-sm">
+              <h3 className="text-lg font-semibold text-slate-900">How much do you want to save this month?</h3>
+              <p className="mt-1 text-sm text-slate-600">
+                Based on your current expenses and EMI, you have a monthly surplus of <span className="font-semibold text-amber-700">{formatCurrency(savingsSnapshot?.currentSurplus || 0)}</span> available.
+              </p>
+
+              <div className="mt-4 flex flex-col gap-3 sm:flex-row sm:items-end">
+                <label className="flex-1 space-y-2">
+                  <span className="text-sm font-medium text-slate-600">Monthly Saving Goal</span>
+                  <input
+                    type="text"
+                    inputMode="numeric"
+                    value={monthlySavingGoal}
+                    onChange={(e) => setMonthlySavingGoal(digitsOnly(e.target.value))}
+                    placeholder="Enter amount you want to save"
+                    className="input-field"
+                  />
+                </label>
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (monthlySavingGoal && Number(monthlySavingGoal) > 0) {
+                      const savingAmount = Number(monthlySavingGoal)
+                      const now = new Date()
+                      const periodKey = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`
+                      const currentMonth = now.toLocaleDateString('en-IN', { month: 'long' })
+                      const monthYearLabel = now.toLocaleDateString('en-IN', {
+                        month: 'long',
+                        year: 'numeric',
+                      })
+                      
+                      setSavingsLedger((prev) => {
+                        const existingIndex = prev.findIndex((item) => item.periodKey === periodKey)
+                        const newEntry = {
+                          periodKey,
+                          monthYearLabel,
+                          savedAmount: savingAmount,
+                          monthlyBalance: analysisResult.summary.monthlyIncome - analysisResult.summary.totalEmi - (Number(monthlyExpenses) || 0),
+                          income: analysisResult.summary.monthlyIncome,
+                          expenses: Number(monthlyExpenses) || 0,
+                          emi: analysisResult.summary.totalEmi,
+                          updatedAt: new Date().toISOString(),
+                        }
+
+                        if (existingIndex >= 0) {
+                          const updated = [...prev]
+                          updated[existingIndex] = newEntry
+                          return updated
+                        }
+
+                        return [...prev, newEntry]
+                      })
+
+                      setSavedMoneyByMonth((prev) => ({
+                        ...prev,
+                        [currentMonth]: String(savingAmount),
+                      }))
+                      
+                      setMonthlySavingGoal('')
+                    }
+                  }}
+                  className="pill-btn"
+                >
+                  Add to Dashboard
+                </button>
+              </div>
+
+              {monthlySavingGoal && Number(monthlySavingGoal) > 0 && (
+                <div className="mt-3 rounded-lg border border-amber-100 bg-white/80 p-3">
+                  <div className="flex items-center justify-between">
+                    <span className="text-sm text-slate-600">After saving {formatCurrency(Number(monthlySavingGoal))}:</span>
+                    <span className={`font-semibold ${Number(monthlySavingGoal) <= (savingsSnapshot?.currentSurplus || 0) ? 'text-emerald-700' : 'text-rose-700'}`}>
+                      {formatCurrency((savingsSnapshot?.currentSurplus || 0) - Number(monthlySavingGoal))} left
+                    </span>
+                  </div>
+                </div>
+              )}
+            </div>
+
+            <div className="grid gap-4 md:grid-cols-4">
               <div className="metric-card">
                 <p className="text-sm text-slate-500">Total EMI</p>
-                <p className="mt-1 text-2xl font-semibold text-slate-900">{formatCurrency(totals.totalEmi)}</p>
+                <p className="mt-1 text-2xl font-semibold text-slate-900">{formatCurrency(analysisResult.summary.totalEmi)}</p>
               </div>
               <div className="metric-card">
                 <p className="text-sm text-slate-500">Monthly Income</p>
-                <p className="mt-1 text-2xl font-semibold text-slate-900">{formatCurrency(totals.income)}</p>
+                <p className="mt-1 text-2xl font-semibold text-slate-900">{formatCurrency(analysisResult.summary.monthlyIncome)}</p>
               </div>
               <div className="metric-card">
                 <p className="text-sm text-slate-500">EMI Ratio</p>
-                <p className="mt-1 text-2xl font-semibold text-slate-900">{totals.ratio.toFixed(1)}%</p>
+                <p className="mt-1 text-2xl font-semibold text-slate-900">{analysisResult.summary.ratio.toFixed(1)}%</p>
+              </div>
+              <div className="metric-card">
+                <p className="text-sm text-slate-500">Monthly Balance</p>
+                <p
+                  className={`mt-1 text-2xl font-semibold ${
+                    totals.monthlyBalance >= 0 ? 'text-emerald-700' : 'text-rose-700'
+                  }`}
+                >
+                  {formatCurrency(totals.monthlyBalance)}
+                </p>
               </div>
             </div>
 
@@ -251,9 +679,9 @@ function App() {
               <div className="flex flex-wrap items-center gap-3">
                 <p className="text-sm font-medium text-slate-700">Risk Status</p>
                 <span
-                  className={`rounded-full border px-3 py-1 text-sm font-semibold ${currentRisk.badge}`}
+                  className={`rounded-full border px-3 py-1 text-sm font-semibold ${analysisResult.currentRisk.badge}`}
                 >
-                  {currentRisk.label}
+                  {analysisResult.currentRisk.label}
                 </span>
               </div>
 
@@ -261,34 +689,205 @@ function App() {
                 <div
                   className="h-full transition-all duration-700"
                   style={{
-                    width: `${Math.min(totals.ratio, 100)}%`,
-                    backgroundColor: currentRisk.color,
+                    width: `${Math.min(analysisResult.summary.ratio, 100)}%`,
+                    backgroundColor: analysisResult.currentRisk.color,
                   }}
                 />
               </div>
 
-              <p className="mt-4 text-sm text-slate-700">{currentRisk.advice}</p>
+              <p className="mt-4 text-sm text-slate-700">{analysisResult.currentRisk.advice}</p>
             </div>
 
-            {totals.future > 0 && (
+            {analysisResult.futureSnapshot && (
               <div className="rounded-2xl border border-slate-200 bg-gradient-to-r from-slate-50 to-sky-50 p-5 shadow-sm">
                 <h3 className="text-lg font-semibold text-slate-900">Future Snapshot</h3>
                 <p className="mt-1 text-sm text-slate-600">
-                  If you add {formatCurrency(totals.future)} EMI, your projected ratio becomes{' '}
-                  <span className="font-semibold text-slate-900">{totals.futureRatio.toFixed(1)}%</span>.
+                  If you add {formatCurrency(analysisResult.futureSnapshot.futureEmi)} EMI, your projected ratio becomes{' '}
+                  <span className="font-semibold text-slate-900">{analysisResult.futureSnapshot.futureRatio.toFixed(1)}%</span>.
                 </p>
 
                 <div className="mt-3 flex flex-wrap items-center gap-2">
                   <span
-                    className={`rounded-full border px-3 py-1 text-sm font-semibold ${futureRisk.badge}`}
+                    className={`rounded-full border px-3 py-1 text-sm font-semibold ${analysisResult.futureSnapshot.futureRisk.badge}`}
                   >
-                    {futureRisk.label}
+                    {analysisResult.futureSnapshot.futureRisk.label}
                   </span>
                 </div>
 
-                <p className="mt-3 text-sm text-slate-700">{futureRisk.advice}</p>
+                <p className="mt-3 text-sm text-slate-700">{analysisResult.futureSnapshot.futureRisk.advice}</p>
               </div>
             )}
+
+            {savingsSnapshot && (
+              <div className="rounded-2xl border border-emerald-200 bg-gradient-to-r from-emerald-50/80 to-teal-50/80 p-5 shadow-sm">
+                <h3 className="text-lg font-semibold text-slate-900">Savings Dashboard</h3>
+                <p className="mt-1 text-sm text-slate-600">
+                  A practical monthly savings plan based on your current EMI load.
+                </p>
+
+                <div className="mt-4 grid gap-4 md:grid-cols-3">
+                  <div className="rounded-xl border border-emerald-100 bg-white/90 p-4">
+                    <p className="text-xs uppercase tracking-wide text-slate-500">Monthly Balance</p>
+                    <p
+                      className={`mt-1 text-xl font-semibold ${
+                        savingsSnapshot.monthlyBalance >= 0 ? 'text-slate-900' : 'text-rose-700'
+                      }`}
+                    >
+                      {formatCurrency(savingsSnapshot.monthlyBalance)}
+                    </p>
+                  </div>
+                  <div className="rounded-xl border border-emerald-100 bg-white/90 p-4">
+                    <p className="text-xs uppercase tracking-wide text-slate-500">Monthly Surplus</p>
+                    <p className="mt-1 text-xl font-semibold text-slate-900">
+                      {formatCurrency(savingsSnapshot.currentSurplus)}
+                    </p>
+                  </div>
+                  <div className="rounded-xl border border-emerald-100 bg-white/90 p-4">
+                    <p className="text-xs uppercase tracking-wide text-slate-500">Suggested Monthly Savings</p>
+                    <p className="mt-1 text-xl font-semibold text-slate-900">
+                      {formatCurrency(savingsSnapshot.recommendedMonthlySaving)}
+                    </p>
+                  </div>
+                  <div className="rounded-xl border border-emerald-100 bg-white/90 p-4">
+                    <p className="text-xs uppercase tracking-wide text-slate-500">Emergency Fund Target</p>
+                    <p className="mt-1 text-xl font-semibold text-slate-900">
+                      {formatCurrency(savingsSnapshot.emergencyFundTarget)}
+                    </p>
+                  </div>
+                </div>
+
+                <div className="mt-4 rounded-xl border border-emerald-100 bg-white/90 p-4">
+                  <div className="flex flex-wrap items-center justify-between gap-3">
+                    <p className="text-sm font-medium text-slate-700">Monthly Saving Goal Check</p>
+                    <span
+                      className={`rounded-full px-3 py-1 text-xs font-semibold ${
+                        savingsSnapshot.goalFeasible
+                          ? 'bg-emerald-100 text-emerald-700'
+                          : 'bg-rose-100 text-rose-700'
+                      }`}
+                    >
+                      {savingsSnapshot.goalFeasible ? 'Goal is achievable' : 'Goal exceeds leftover amount'}
+                    </span>
+                  </div>
+
+                  <div className="mt-3 grid gap-3 md:grid-cols-3">
+                    <div>
+                      <p className="text-xs uppercase tracking-wide text-slate-500">Your Goal</p>
+                      <p className="mt-1 text-lg font-semibold text-slate-900">
+                        {formatCurrency(savingsSnapshot.savingGoal)}
+                      </p>
+                    </div>
+                    <div>
+                      <p className="text-xs uppercase tracking-wide text-slate-500">Left After Saving</p>
+                      <p
+                        className={`mt-1 text-lg font-semibold ${
+                          savingsSnapshot.postGoalBalance >= 0 ? 'text-emerald-700' : 'text-rose-700'
+                        }`}
+                      >
+                        {formatCurrency(savingsSnapshot.postGoalBalance)}
+                      </p>
+                    </div>
+                    <div>
+                      <p className="text-xs uppercase tracking-wide text-slate-500">Coverage</p>
+                      <p className="mt-1 text-lg font-semibold text-slate-900">
+                        {savingsSnapshot.savingGoal > 0
+                          ? `${Math.min(savingsSnapshot.goalCoverageRatio, 999).toFixed(1)}%`
+                          : 'N/A'}
+                      </p>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="mt-4 grid gap-4 md:grid-cols-2">
+                  <div className="rounded-xl border border-emerald-100 bg-white/90 p-4">
+                    <div className="flex items-center justify-between gap-3">
+                      <p className="text-sm font-medium text-slate-700">Savings Capacity Ratio</p>
+                      <span className="text-sm font-semibold text-emerald-700">
+                        {savingsSnapshot.surplusRatio.toFixed(1)}%
+                      </span>
+                    </div>
+                    <div className="mt-3 h-2.5 overflow-hidden rounded-full bg-emerald-100">
+                      <div
+                        className="h-full rounded-full bg-emerald-500"
+                        style={{ width: `${Math.min(savingsSnapshot.surplusRatio, 100)}%` }}
+                      />
+                    </div>
+                  </div>
+
+                  <div className="rounded-xl border border-emerald-100 bg-white/90 p-4">
+                    <div className="flex items-center justify-between gap-3">
+                      <p className="text-sm font-medium text-slate-700">Target Savings Rate</p>
+                      <span className="text-sm font-semibold text-emerald-700">
+                        {savingsSnapshot.recommendedSavingRate.toFixed(1)}%
+                      </span>
+                    </div>
+                    <div className="mt-3 h-2.5 overflow-hidden rounded-full bg-emerald-100">
+                      <div
+                        className="h-full rounded-full bg-teal-500"
+                        style={{ width: `${Math.min(savingsSnapshot.recommendedSavingRate, 100)}%` }}
+                      />
+                    </div>
+                  </div>
+                </div>
+
+                <div className="mt-4 rounded-xl border border-emerald-100 bg-white/90 p-4 text-sm text-slate-700">
+                  <p>
+                    You can reach your emergency fund target in approximately{' '}
+                    <span className="font-semibold text-slate-900">
+                      {savingsSnapshot.monthsToEmergencyFund ?? 'N/A'} months
+                    </span>{' '}
+                    if you save the suggested amount consistently.
+                  </p>
+                  {savingsSnapshot.futureSurplus !== null && (
+                    <p className="mt-2">
+                      With the planned future EMI, your monthly surplus could become{' '}
+                      <span className="font-semibold text-slate-900">
+                        {formatCurrency(savingsSnapshot.futureSurplus)}
+                      </span>
+                      .
+                    </p>
+                  )}
+                  <p className="mt-2">
+                    You have already saved{' '}
+                    <span className="font-semibold text-slate-900">
+                      {formatCurrency(historicalSavings.totalSaved)}
+                    </span>{' '}
+                    this year, with an average of{' '}
+                    <span className="font-semibold text-slate-900">
+                      {formatCurrency(historicalSavings.averageSaved)}
+                    </span>{' '}
+                    in active savings months.
+                  </p>
+                  <p className="mt-2">
+                    Your highest savings month is{' '}
+                    <span className="font-semibold text-slate-900">
+                      {historicalSavings.highestMonth.month}
+                    </span>{' '}
+                    at{' '}
+                    <span className="font-semibold text-slate-900">
+                      {formatCurrency(historicalSavings.highestMonth.amount)}
+                    </span>
+                    .
+                  </p>
+                </div>
+              </div>
+            )}
+
+            {isLoadingAdvice ? (
+              <div className="rounded-2xl border border-slate-200 bg-white/90 p-5 shadow-sm">
+                <p className="animate-pulse text-sm text-slate-600">Generating personalized advice from Claude...</p>
+              </div>
+            ) : advice ? (
+              <div className="rounded-2xl border-2 border-blue-300 bg-gradient-to-r from-blue-50 to-cyan-50 p-5 shadow-md">
+                <div className="flex items-start gap-3">
+                  <span className="text-2xl">✨</span>
+                  <div className="flex-1">
+                    <h3 className="font-semibold text-slate-900">Your Personalized Financial Advice</h3>
+                    <p className="mt-2 whitespace-pre-line text-sm leading-relaxed text-slate-700">{advice}</p>
+                  </div>
+                </div>
+              </div>
+            ) : null}
           </section>
         )}
       </div>
@@ -297,3 +896,4 @@ function App() {
 }
 
 export default App
+
